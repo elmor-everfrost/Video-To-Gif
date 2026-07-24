@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Video to GIF (Crop + High-Res)</title>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/gif.js/0.2.0/gif.js"></script>
+    <style>
+        body {
+            font-family: sans-serif;
+            margin: 20px;
+            background: #f9f9f9;
+        }
+        .control-group {
+            margin-bottom: 15px;
+        }
+        .control-group.disabled {
+            opacity: 0.5;
+            pointer-events: none;
+        }
+        #videoWrap {
+            position: relative;
+            display: none;
+            margin-top: 10px;
+        }
+        #playerVideo {
+            display: block;
+            background: #000;
+        }
+        #cropOverlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            cursor: crosshair;
+        }
+        #playerControls {
+            display: none;
+            align-items: center;
+            gap: 8px;
+            margin-top: 6px;
+        }
+        #seekBar {
+            flex: 1;
+        }
+        .coord-inputs input {
+            width: 70px;
+            margin-right: 4px;
+        }
+        #captureCanvas {
+            display: none;
+        }
+        #outputGif {
+            margin-top: 10px;
+            border: 2px solid #4CAF50;
+            display: none;
+            max-width: 100%;
+        }
+        #status {
+            font-weight: bold;
+            color: #333;
+            margin-bottom: 10px;
+        }
+        small.hint {
+            color: #666;
+            display: block;
+            margin-top: 4px;
+        }
+    </style>
+</head>
+<body>
+
+    <h2>Video to GIF Converter</h2>
+    <p><small>Note: GIF files get huge fast. Cropping to just the area you need is the best way to keep quality high without a giant file &mdash; that's usually better than just scaling the whole frame down.</small></p>
+
+    <div class="control-group">
+        <label>1. Select Video (MP4, WebM, MOV, etc.): <input type="file" id="videoUpload" accept="video/mp4,video/quicktime,video/webm,video/ogg,video/*"></label>
+    </div>
+
+    <div class="control-group" id="cropSection" style="display:none;">
+        <label>2. Play/scrub the video below and drag directly on it to draw your crop box:</label>
+        <div id="videoWrap">
+            <video id="playerVideo" muted playsinline></video>
+            <canvas id="cropOverlay"></canvas>
+        </div>
+        <div id="playerControls">
+            <button id="playPauseBtn" type="button">Play</button>
+            <input type="range" id="seekBar" min="0" max="0" step="0.01" value="0">
+            <span id="timeLabel">0:00 / 0:00</span>
+        </div>
+        <div class="coord-inputs" style="margin-top:6px;">
+            X: <input type="number" id="cropX" min="0">
+            Y: <input type="number" id="cropY" min="0">
+            W: <input type="number" id="cropW" min="1">
+            H: <input type="number" id="cropH" min="1">
+            <button id="resetCropBtn" type="button">Reset to Full Frame</button>
+        </div>
+        <small class="hint">Coordinates are in the source video's native pixels, regardless of how big the preview looks on screen. Starting a drag auto-pauses playback so the box doesn't move on you.</small>
+    </div>
+
+    <div class="control-group">
+        <label><input type="checkbox" id="highResToggle"> High-Res Export (export the crop at its full native resolution, no downscale)</label>
+        <small class="hint">Overrides the Resolution Scale slider below. Best quality, but biggest file size &mdash; keep the crop area tight if you use this.</small>
+    </div>
+
+    <div class="control-group" id="scaleGroup">
+        <label>3. Resolution Scale (applied to the crop area): <span id="scaleVal">50</span>%</label><br>
+        <input type="range" id="scale" min="10" max="100" value="50" oninput="document.getElementById('scaleVal').innerText = this.value">
+    </div>
+
+    <div class="control-group">
+        <label>4. FPS (Frames per second): <span id="fpsVal">15</span></label><br>
+        <input type="range" id="fps" min="5" max="30" value="15" oninput="document.getElementById('fpsVal').innerText = this.value">
+    </div>
+
+    <div class="control-group">
+        <label>5. Quality: <span id="qualityVal">5</span> (1 = best/slowest, 20 = worst/fastest)</label><br>
+        <input type="range" id="quality" min="1" max="20" value="5" oninput="document.getElementById('qualityVal').innerText = this.value">
+    </div>
+
+    <div class="control-group">
+        <label><input type="checkbox" id="ditherToggle"> Enable Dithering (smoother gradients, slightly larger file)</label>
+    </div>
+
+    <div class="control-group">
+        <button id="convertBtn">6. Start Conversion</button>
+        <button id="stopBtn" disabled>Stop &amp; Render Early</button>
+    </div>
+
+    <div id="status">Waiting for video...</div>
+
+    <canvas id="captureCanvas"></canvas>
+
+    <!-- Output GIF -->
+    <br>
+    <img id="outputGif" alt="Generated GIF will appear here">
+
+    <script>
+        const videoUpload = document.getElementById('videoUpload');
+        const convertBtn = document.getElementById('convertBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const scaleInput = document.getElementById('scale');
+        const scaleGroup = document.getElementById('scaleGroup');
+        const fpsInput = document.getElementById('fps');
+        const qualityInput = document.getElementById('quality');
+        const ditherToggle = document.getElementById('ditherToggle');
+        const highResToggle = document.getElementById('highResToggle');
+        const statusText = document.getElementById('status');
+
+        const video = document.getElementById('playerVideo');
+        const captureCanvas = document.getElementById('captureCanvas');
+        const captureCtx = captureCanvas.getContext('2d', { willReadFrequently: true });
+        const outputGif = document.getElementById('outputGif');
+
+        // Crop UI elements
+        const cropSection = document.getElementById('cropSection');
+        const videoWrap = document.getElementById('videoWrap');
+        const cropOverlay = document.getElementById('cropOverlay'); 
+        const overlayCtx = cropOverlay.getContext('2d');
+        const cropXInput = document.getElementById('cropX');
+        const cropYInput = document.getElementById('cropY');
+        const cropWInput = document.getElementById('cropW');
+        const cropHInput = document.getElementById('cropH');
+        const resetCropBtn = document.getElementById('resetCropBtn');
+
+        // Player controls
+        const playerControls = document.getElementById('playerControls');
+        const playPauseBtn = document.getElementById('playPauseBtn');
+        const seekBar = document.getElementById('seekBar');
+        const timeLabel = document.getElementById('timeLabel');
+        let isScrubbingSeekBar = false;
+
+        let gifWorkerBlobUrl = null;
+        let captureInterval = null;
+        let gif = null;
+        let isCapturing = false;
+
+        // Native video dimensions and the scale factor between the displayed
+        // preview (shrunk to fit the screen) and those native pixels.
+        let videoNativeWidth = 0;
+        let videoNativeHeight = 0;
+        let displayScale = 1;
+        const MAX_PREVIEW_WIDTH = 640;
+
+        // Crop rectangle, always stored in native video pixel coordinates.
+        let cropRect = { x: 0, y: 0, w: 0, h: 0 };
+        let isDragging = false;
+        let dragStart = { x: 0, y: 0 };
+
+        async function initWorker() {
+            try {
+                const res = await fetch('https://cdnjs.cloudflare.com/ajax/libs/gif.js/0.2.0/gif.worker.js');
+                const text = await res.text();
+                const blob = new Blob([text], { type: 'application/javascript' });
+                gifWorkerBlobUrl = URL.createObjectURL(blob);
+            } catch (err) {
+                statusText.innerText = "Error loading GIF worker. Make sure you have internet access.";
+            }
+        }
+        initWorker(); // Call immediately on load
+
+        function formatTime(t) {
+            if (!isFinite(t)) return "0:00";
+            const m = Math.floor(t / 60);
+            const s = Math.floor(t % 60).toString().padStart(2, '0');
+            return `${m}:${s}`;
+        }
+
+        // Load video when selected
+        videoUpload.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            video.src = URL.createObjectURL(file);
+            video.load();
+            statusText.innerText = "Loading video metadata...";
+        });
+
+        // Metadata gives us real dimensions and duration as soon as they're known -
+        // no need to wait for a frame to decode, since the <video> element renders itself.
+        video.addEventListener('loadedmetadata', () => {
+            videoNativeWidth = video.videoWidth;
+            videoNativeHeight = video.videoHeight;
+
+            // Default crop = full frame
+            cropRect = { x: 0, y: 0, w: videoNativeWidth, h: videoNativeHeight };
+
+            setupPlayerAndCropOverlay();
+            seekBar.max = video.duration || 0;
+            timeLabel.innerText = `${formatTime(0)} / ${formatTime(video.duration)}`;
+
+            statusText.innerText = "Video loaded. Play/scrub to check it, adjust the crop, then start conversion.";
+        });
+
+        function setupPlayerAndCropOverlay() {
+            displayScale = Math.min(1, MAX_PREVIEW_WIDTH / videoNativeWidth);
+            const dispW = Math.round(videoNativeWidth * displayScale);
+            const dispH = Math.round(videoNativeHeight * displayScale);
+
+            videoWrap.style.width = dispW + 'px';
+            videoWrap.style.height = dispH + 'px';
+
+            video.style.width = dispW + 'px';
+            video.style.height = dispH + 'px';
+
+            cropOverlay.width = dispW;
+            cropOverlay.height = dispH;
+            cropOverlay.style.width = dispW + 'px';
+            cropOverlay.style.height = dispH + 'px';
+
+            videoWrap.style.display = 'block';
+            playerControls.style.display = 'flex';
+            cropSection.style.display = 'block';
+
+            syncCropInputs();
+            drawCropOverlay();
+        }
+
+        function drawCropOverlay() {
+            overlayCtx.clearRect(0, 0, cropOverlay.width, cropOverlay.height);
+
+            const rx = cropRect.x * displayScale;
+            const ry = cropRect.y * displayScale;
+            const rw = cropRect.w * displayScale;
+            const rh = cropRect.h * displayScale;
+
+            // Dim everything outside the crop box so the selection is obvious over the moving video
+            overlayCtx.fillStyle = 'rgba(0,0,0,0.35)';
+            overlayCtx.fillRect(0, 0, cropOverlay.width, ry); // top
+            overlayCtx.fillRect(0, ry + rh, cropOverlay.width, cropOverlay.height - (ry + rh)); // bottom
+            overlayCtx.fillRect(0, ry, rx, rh); // left
+            overlayCtx.fillRect(rx + rw, ry, cropOverlay.width - (rx + rw), rh); // right
+
+            overlayCtx.strokeStyle = '#4CAF50';
+            overlayCtx.lineWidth = 2;
+            overlayCtx.setLineDash([6, 4]);
+            overlayCtx.strokeRect(rx, ry, rw, rh);
+            overlayCtx.setLineDash([]);
+        }
+
+        function clampCropRect() {
+            cropRect.x = Math.max(0, Math.min(cropRect.x, videoNativeWidth - 1));
+            cropRect.y = Math.max(0, Math.min(cropRect.y, videoNativeHeight - 1));
+            cropRect.w = Math.max(1, Math.min(cropRect.w, videoNativeWidth - cropRect.x));
+            cropRect.h = Math.max(1, Math.min(cropRect.h, videoNativeHeight - cropRect.y));
+        }
+
+        function syncCropInputs() {
+            cropXInput.value = Math.round(cropRect.x);
+            cropYInput.value = Math.round(cropRect.y);
+            cropWInput.value = Math.round(cropRect.w);
+            cropHInput.value = Math.round(cropRect.h);
+        }
+
+        function toVideoCoords(evt) {
+            const rect = cropOverlay.getBoundingClientRect();
+            const x = (evt.clientX - rect.left) / displayScale;
+            const y = (evt.clientY - rect.top) / displayScale;
+            return {
+                x: Math.max(0, Math.min(x, videoNativeWidth)),
+                y: Math.max(0, Math.min(y, videoNativeHeight))
+            };
+        }
+
+        // Drag directly on the (playing or paused) video to draw a new crop rectangle
+        cropOverlay.addEventListener('mousedown', (evt) => {
+            // Auto-pause so the frame holds still while you draw the box
+            if (!video.paused) video.pause();
+
+            isDragging = true;
+            dragStart = toVideoCoords(evt);
+            cropRect = { x: dragStart.x, y: dragStart.y, w: 0, h: 0 };
+        });
+
+        cropOverlay.addEventListener('mousemove', (evt) => {
+            if (!isDragging) return;
+            const pos = toVideoCoords(evt);
+            cropRect.x = Math.min(dragStart.x, pos.x);
+            cropRect.y = Math.min(dragStart.y, pos.y);
+            cropRect.w = Math.abs(pos.x - dragStart.x);
+            cropRect.h = Math.abs(pos.y - dragStart.y);
+            drawCropOverlay();
+        });
+
+        window.addEventListener('mouseup', () => {
+            if (!isDragging) return;
+            isDragging = false;
+            if (cropRect.w < 5 || cropRect.h < 5) {
+                // Too small a drag (e.g. an accidental click) - reset to full frame
+                cropRect = { x: 0, y: 0, w: videoNativeWidth, h: videoNativeHeight };
+            }
+            clampCropRect();
+            syncCropInputs();
+            drawCropOverlay();
+        });
+
+        // Manual numeric entry, for when you want exact pixel values
+        [cropXInput, cropYInput, cropWInput, cropHInput].forEach(input => {
+            input.addEventListener('change', () => {
+                cropRect.x = parseInt(cropXInput.value) || 0;
+                cropRect.y = parseInt(cropYInput.value) || 0;
+                cropRect.w = parseInt(cropWInput.value) || 1;
+                cropRect.h = parseInt(cropHInput.value) || 1;
+                clampCropRect();
+                syncCropInputs();
+                drawCropOverlay();
+            });
+        });
+
+        resetCropBtn.addEventListener('click', () => {
+            cropRect = { x: 0, y: 0, w: videoNativeWidth, h: videoNativeHeight };
+            syncCropInputs();
+            drawCropOverlay();
+        });
+
+        // --- Playback controls, so you can actually watch the video to judge the crop ---
+        playPauseBtn.addEventListener('click', () => {
+            if (video.paused) {
+                video.play();
+            } else {
+                video.pause();
+            }
+        });
+        video.addEventListener('play', () => { playPauseBtn.innerText = 'Pause'; });
+        video.addEventListener('pause', () => { playPauseBtn.innerText = 'Play'; });
+
+        video.addEventListener('timeupdate', () => {
+            if (!isScrubbingSeekBar) seekBar.value = video.currentTime;
+            timeLabel.innerText = `${formatTime(video.currentTime)} / ${formatTime(video.duration)}`;
+        });
+
+        seekBar.addEventListener('mousedown', () => { isScrubbingSeekBar = true; });
+        seekBar.addEventListener('touchstart', () => { isScrubbingSeekBar = true; });
+        seekBar.addEventListener('input', () => {
+            video.currentTime = parseFloat(seekBar.value);
+        });
+        seekBar.addEventListener('mouseup', () => { isScrubbingSeekBar = false; });
+        seekBar.addEventListener('touchend', () => { isScrubbingSeekBar = false; });
+
+        // High-res toggle just disables the scale slider - the effective
+        // scale is computed at conversion time in getEffectiveScale()
+        highResToggle.addEventListener('change', () => {
+            scaleGroup.classList.toggle('disabled', highResToggle.checked);
+        });
+
+        function getEffectiveScale() {
+            return highResToggle.checked ? 1 : (parseInt(scaleInput.value) / 100);
+        }
+
+        // Start Conversion
+        convertBtn.addEventListener('click', () => {
+            if (!video.src) return alert("Please upload a video first.");
+            if (!gifWorkerBlobUrl) return alert("Still loading worker script... Please wait a moment.");
+
+            const fps = parseInt(fpsInput.value);
+            const quality = parseInt(qualityInput.value);
+            const dither = ditherToggle.checked ? 'FloydSteinberg-serpentine' : false;
+            const effectiveScale = getEffectiveScale();
+
+            // Output size = crop size * scale. Cropping first means the
+            // scale only has to shrink the region you actually care about
+            captureCanvas.width = Math.max(1, Math.floor(cropRect.w * effectiveScale));
+            captureCanvas.height = Math.max(1, Math.floor(cropRect.h * effectiveScale));
+            outputGif.style.display = "none";
+
+            // Initialize GIF instance
+            gif = new GIF({
+                workers: 4,
+                quality: quality,
+                width: captureCanvas.width,
+                height: captureCanvas.height,
+                workerScript: gifWorkerBlobUrl,
+                dither: dither
+            });
+
+            // Handle GIF Render Progress
+            gif.on('progress', (p) => {
+                statusText.innerText = `Rendering GIF... ${Math.round(p * 100)}%`;
+            });
+
+            // Handle GIF Finished
+            gif.on('finished', (blob) => {
+                statusText.innerText = "Done! You can right-click the GIF below to save it.";
+                const url = URL.createObjectURL(blob);
+                outputGif.src = url;
+                outputGif.style.display = "block";
+
+                convertBtn.disabled = false;
+                stopBtn.disabled = true;
+            });
+
+            // Prepare playback for capture (watch the on-screen video to follow along)
+            video.currentTime = 0;
+            convertBtn.disabled = true;
+            stopBtn.disabled = false;
+            isCapturing = true;
+
+            // Wait for video to actually start playing before capturing frames
+            video.addEventListener('playing', () => {
+                const captureDelay = 1000 / fps;
+
+                captureInterval = setInterval(() => {
+                    if (!isCapturing) return;
+
+                    // Draw only the cropped region of the video frame, scaled
+                    // straight to the final output size in one step.
+                    captureCtx.drawImage(
+                        video,
+                        cropRect.x, cropRect.y, cropRect.w, cropRect.h,
+                        0, 0, captureCanvas.width, captureCanvas.height
+                    );
+
+                    // Add frame to GIF encoder
+                    gif.addFrame(captureCanvas, { copy: true, delay: captureDelay });
+
+                    statusText.innerText = `Capturing video... Time: ${video.currentTime.toFixed(1)}s`;
+                }, captureDelay);
+            }, { once: true });
+
+            video.play();
+        });
+
+        // Stop capturing early or when video ends naturally
+        function finishCapture() {
+            if (!isCapturing) return;
+            isCapturing = false;
+            clearInterval(captureInterval);
+            video.pause();
+            statusText.innerText = 'Compiling frames...';
+            gif.render();
+        }
+
+        video.addEventListener('ended', finishCapture);
+        stopBtn.addEventListener('click', finishCapture);
+
+    </script>
+</body>
+</html>
