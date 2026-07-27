@@ -171,7 +171,7 @@
         let isScrubbingSeekBar = false;
 
         let gifWorkerBlobUrl = null;
-        let captureInterval = null;
+        let currentSeekHandler = null; // Replaced captureInterval
         let gif = null;
         let isCapturing = false;
 
@@ -428,48 +428,70 @@
                 stopBtn.disabled = true;
             });
 
-            // Prepare playback for capture (watch the on-screen video to follow along)
-            video.currentTime = 0;
+            // Pause the video so we can manually control the timeline
+            video.pause();
             convertBtn.disabled = true;
             stopBtn.disabled = false;
             isCapturing = true;
 
-            // Wait for video to actually start playing before capturing frames
-            video.addEventListener('playing', () => {
-                const captureDelay = 1000 / fps;
+            const captureDelayMs = 1000 / fps;
+            const timeStep = 1 / fps; // how far to jump forward each frame
+            let captureTime = 0;
 
-                captureInterval = setInterval(() => {
-                    if (!isCapturing) return;
+            // This function captures a frame, then tells the video to seek to the next frame
+            currentSeekHandler = function() {
+                if (!isCapturing) return;
 
-                    // Draw only the cropped region of the video frame, scaled
-                    // straight to the final output size in one step.
-                    captureCtx.drawImage(
-                        video,
-                        cropRect.x, cropRect.y, cropRect.w, cropRect.h,
-                        0, 0, captureCanvas.width, captureCanvas.height
-                    );
+                // Draw only the cropped region of the video frame, scaled
+                // straight to the final output size in one step.
+                captureCtx.drawImage(
+                    video,
+                    cropRect.x, cropRect.y, cropRect.w, cropRect.h,
+                    0, 0, captureCanvas.width, captureCanvas.height
+                );
 
-                    // Add frame to GIF encoder
-                    gif.addFrame(captureCanvas, { copy: true, delay: captureDelay });
+                // Add frame to GIF encoder
+                gif.addFrame(captureCanvas, { copy: true, delay: captureDelayMs });
+                statusText.innerText = `Capturing video... Time: ${captureTime.toFixed(1)}s`;
 
-                    statusText.innerText = `Capturing video... Time: ${video.currentTime.toFixed(1)}s`;
-                }, captureDelay);
-            }, { once: true });
+                captureTime += timeStep;
 
-            video.play();
+                // Stop if we reach the end (leaving a tiny margin for math precision)
+                if (captureTime >= video.duration - 0.001) {
+                    finishCapture();
+                } else {
+                    // Tell the video to load the next timestamp. 
+                    // This will trigger 'seeked' again, creating a perfect loop.
+                    video.currentTime = captureTime; 
+                }
+            };
+
+            // Listen for when the video successfully finishes seeking to the next frame
+            video.addEventListener('seeked', currentSeekHandler);
+
+            // Kick off the capture loop
+            if (video.currentTime === 0) {
+                currentSeekHandler(); // Trigger manually if already at 0:00
+            } else {
+                video.currentTime = 0; // Seeking to 0 triggers the first frame automatically
+            }
         });
 
         // Stop capturing early or when video ends naturally
         function finishCapture() {
             if (!isCapturing) return;
             isCapturing = false;
-            clearInterval(captureInterval);
-            video.pause();
+
+            // Clean up our manual seek listener
+            if (currentSeekHandler) {
+                video.removeEventListener('seeked', currentSeekHandler);
+                currentSeekHandler = null;
+            }
+
             statusText.innerText = 'Compiling frames...';
             gif.render();
         }
 
-        video.addEventListener('ended', finishCapture);
         stopBtn.addEventListener('click', finishCapture);
 
     </script>
